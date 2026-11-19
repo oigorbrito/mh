@@ -1,0 +1,30 @@
+name: upstream issue and PR tracker
+
+on:
+  schedule:
+    - cron: "23 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+concurrency:
+  group: upstream-tracker
+  cancel-in-progress: false
+
+jobs:
+  mirror-relevant-upstream-work:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Mirror relevant upstream issues and pull requests
+        env:
+          GH_TOKEN: \${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: \${{ github.repository }}
+          UPSTREAM_REPOSITORY: HarnessRouter/harnessrouter
+        run: python3 .github/scripts/sync-upstream.py
