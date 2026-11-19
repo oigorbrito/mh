@@ -18,13 +18,13 @@ jobs:
   mirror-relevant-upstream-work:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+      UPSTREAM_REPOSITORY: HarnessRouter/harnessrouter
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
       - name: Mirror relevant upstream issues and pull requests
-        env:
-          GH_TOKEN: \${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: \${{ github.repository }}
-          UPSTREAM_REPOSITORY: HarnessRouter/harnessrouter
         run: python3 .github/scripts/sync-upstream.py
