@@ -13,14 +13,11 @@ What each test pins is one thing that would otherwise be wrong SILENTLY:
   * a tool policy set on the registry instead of the session, which would withhold the built-ins
     and let every MCP tool through
 """
-import asyncio
-import dataclasses
 import json
 import pathlib
 import subprocess
 import sys
 import tempfile
-import types
 
 DRIVER = pathlib.Path(__file__).resolve().parents[1] / "nanobot_driver.py"
 

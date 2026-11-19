@@ -6,9 +6,12 @@ import io
 import json
 import os
 import pathlib
+import shutil
 import stat
+import subprocess
 import sys
 import tarfile
+import tempfile
 import threading
 import time
 import zipfile
@@ -21,10 +24,15 @@ import environments as E  # noqa: E402
 
 
 @pytest.fixture
-def store(tmp_path, monkeypatch):
-    monkeypatch.setattr(E, "ENV_ROOT", str(tmp_path / "environments"))
-    monkeypatch.setattr(E, "ENV_MOUNT", str(tmp_path / "env"))
-    return tmp_path
+def store(monkeypatch):
+    # Not tmp_path: pytest's basetemp is 0700 root, and as root a build runs as another uid that cannot
+    # traverse it. A 0755 directory of its own is what the runner's volume is.
+    root = pathlib.Path(tempfile.mkdtemp(prefix="hr-runner-env-"))
+    os.chmod(root, 0o755)
+    monkeypatch.setattr(E, "ENV_ROOT", str(root / "environments"))
+    monkeypatch.setattr(E, "ENV_MOUNT", str(root / "env"))
+    yield root
+    shutil.rmtree(root, ignore_errors=True)
 
 
 def test_source_files_round_trip_and_the_tree_counts_them(store):
@@ -385,6 +393,7 @@ def test_the_turn_gets_the_path_the_variables_and_the_instructions(store):
     assert E.resolve({"id": "henv_t", "slug": "studio"})["path"] == link and os.path.islink(link)
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="asserts the off-root branch: no group, no build identity; as root that branch does not apply")
 def test_each_environment_gets_its_own_group_and_its_builds_run_as_it(store, monkeypatch):
     """The group model needs root; what a test process can pin is the allocation, the identity a
     build step gets, the group a turn joins, and that none of it applies off root."""
@@ -612,6 +621,10 @@ def test_a_git_import_lands_files_and_directories_and_never_follows_a_link(store
     seen = {}
 
     def fake_clone(cmd, **kw):
+        # _claim also calls subprocess.run for groupadd/useradd under root: those are not the clone, and must
+        # not reach this fake (it would write a .git into the working directory, named for the group).
+        if cmd[0] != "git":
+            return subprocess.CompletedProcess(cmd, 0, b"", b"")
         seen["env"] = kw.get("env") or {}
         repo = pathlib.Path(cmd[-1])
         (repo / ".git").mkdir(parents=True)
@@ -671,6 +684,8 @@ def test_a_pinned_git_clone_connects_to_the_address_the_gateway_classified(store
     seen = []
 
     def fake_run(cmd, **kw):
+        if cmd[0] != "git":      # groupadd/useradd under root (see _account): not a clone, not recorded here
+            return subprocess.CompletedProcess(cmd, 0, b"", b"")
         seen.append(cmd)
         os.makedirs(cmd[-1], exist_ok=True)
         pathlib.Path(cmd[-1], "README.md").write_text("hi\n")

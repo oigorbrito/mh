@@ -1570,7 +1570,6 @@ def t12(ctx):
     rule, so a task that ended `completed` after one round is a SKIP and not a failure — the model
     ended the turn, and the server truncated nothing.
     """
-    from .fixture import STEP_TOOL_NAME
     base_h = _harness(ctx)
     nonce = uuid.uuid4().hex[:10]
     model = ctx.model or str(base_h.get("defaultModel") or "").strip()

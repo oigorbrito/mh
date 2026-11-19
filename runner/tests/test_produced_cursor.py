@@ -6,7 +6,6 @@ that skipped collection (crash, cancel, OOM, sweep-settle) followed by any check
 buried the turn's files — on disk, invisible to collection, forever.
 """
 import pathlib
-import subprocess
 import sys
 import tempfile
 import time

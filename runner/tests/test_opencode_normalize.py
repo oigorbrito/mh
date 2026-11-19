@@ -332,7 +332,7 @@ def test_error_falls_back_to_the_flat_message_then_the_name():
 
 
 # ── end of stream: opencode has no terminal event, the process exiting is the signal ──
-from server import _opencode_eof, _opencode_to_claude  # noqa: E402
+from server import _opencode_eof  # noqa: E402
 
 
 def test_the_run_loop_can_find_the_eof_hook():

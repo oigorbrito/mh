@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
-import json
 import math
 import os
 import socket
@@ -861,6 +860,3 @@ async def call(s: Session, name: str, args: dict):
     raise BrowserToolError(f"No tool named browser_{name}.")
 
 
-def audit_line(d: dict) -> str:
-    """The record's one-line shape, for the trace and the log."""
-    return json.dumps(d, separators=(",", ":"))

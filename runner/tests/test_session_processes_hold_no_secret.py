@@ -5,7 +5,6 @@ the agent can write: a post-commit hook or a core.fsmonitor command the agent le
 checkpoint with the internal key, and a process of the agent's still running could read /proc/<git>/environ
 (2026-11-02). With the internal key, every session's files and every connection on the box are the agent's.
 """
-import os
 import pathlib
 import subprocess
 import sys

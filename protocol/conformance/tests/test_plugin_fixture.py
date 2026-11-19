@@ -71,7 +71,6 @@ def test_p11_fails_a_reply_without_the_fixture_answer_and_passes_one_with_it():
     assert bad.outcome == Outcome.FAIL and "never reached the plugin's server" in (bad.detail or "")
     # the passing reply must carry the answer for the nonce the check chose, which the fake
     # server cannot know: so pass through whatever text the check sent, reversed, as the fixture would
-    import uhp_conformance.checks as ck
     real_post = _Client.post
     def echo_post(self, path, **kw):
         if path == "/v1/responses":

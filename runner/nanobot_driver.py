@@ -46,7 +46,6 @@ import dataclasses
 import json
 import os
 import sys
-import time
 
 # The NDJSON channel. nanobot logs through loguru, whose default sink is stderr, and the level is
 # raised below — but a stray print from a tool must still be unable to land inside the lines the
@@ -118,7 +117,6 @@ async def _run(job: dict) -> int:
     session_key = str(job.get("session_key") or "harness")
     prompt = str(job.get("prompt") or "")
     disabled = sorted({str(x).split(" (")[0].strip() for x in (job.get("tools_disabled") or []) if x})
-    started = time.time()
     final = ""
     result_sent = False
 

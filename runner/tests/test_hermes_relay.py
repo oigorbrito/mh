@@ -588,6 +588,10 @@ def test_the_turn_hands_the_trace_context_to_the_cli(monkeypatch, tmp_path):
 
 
 def test_a_turn_with_no_trace_context_gives_the_cli_none(monkeypatch, tmp_path):
+    # The assertion is about what the turn adds, so the host's own trace variables must not be in the way:
+    # a container that sets TRACEPARENT for its processes made this test fail for no reason in the code.
+    monkeypatch.delenv("TRACEPARENT", raising=False)
+    monkeypatch.delenv("TRACESTATE", raising=False)
     launched = []
     started = threading.Event()
 

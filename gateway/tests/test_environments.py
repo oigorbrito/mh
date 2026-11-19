@@ -7,9 +7,12 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import sys
+import tempfile
 import time
 import zipfile
+from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
@@ -26,10 +29,15 @@ H = {"x-harness-internal": "test-internal-key", "x-harness-org": ORG, "x-harness
 
 
 @pytest.fixture(scope="module")
-def api(tmp_path_factory):
+def api():
     """The gateway's app, with the runner's environment routes answering its `_env_runner` calls
     in-process: real bytes on a temp volume, real builds (a venv with nothing in it, so no network)."""
-    root = tmp_path_factory.mktemp("envstore")
+    # Not pytest's basetemp: that directory is 0700 root, and as root a build runs as another uid that
+    # cannot traverse it (the build fails with EACCES on the path). A 0755 directory of its own is what
+    # the runner's real volume is, and it is removed at the end of the module.
+    root = Path(tempfile.mkdtemp(prefix="hr-envstore-"))
+    os.chmod(root, 0o755)
+    saved = (E.ENV_ROOT, E.ENV_MOUNT, E._tool_env, app._env_runner)
     E.ENV_ROOT, E.ENV_MOUNT = str(root / "environments"), str(root / "env")
     E._tool_env = lambda: {**os.environ, "PIP_NO_CACHE_DIR": "1", "PIP_DISABLE_PIP_VERSION_CHECK": "1"}
     mini = FastAPI()
@@ -42,14 +50,19 @@ def api(tmp_path_factory):
         return rc.request(method, path, params={"identifier": env_id, **(params or {})}, content=content)
 
     app._env_runner = fake_env_runner
-    with TestClient(app.app) as c:
-        class Api:
-            def __getattr__(self, m):
-                def call(path, **kw):
-                    kw["headers"] = {**H, **(kw.get("headers") or {})}
-                    return getattr(c, m)(path, **kw)
-                return call
-        yield Api()
+    try:
+        with TestClient(app.app) as c:
+            class Api:
+                def __getattr__(self, m):
+                    def call(path, **kw):
+                        kw["headers"] = {**H, **(kw.get("headers") or {})}
+                        return getattr(c, m)(path, **kw)
+                    return call
+            yield Api()
+    finally:
+        # The module replaces these for its own run; another module's tests must see them as they were.
+        E.ENV_ROOT, E.ENV_MOUNT, E._tool_env, app._env_runner = saved
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def _wait_build(api, eid, n, seconds=240):

@@ -23,6 +23,7 @@ real subprocess it is; nothing here reaches api.qoder.com.
 """
 import http.server
 import json
+import os
 import pathlib
 import signal
 import subprocess
@@ -1200,8 +1201,13 @@ def test_an_artifact_over_the_limit_or_unwritable_fails_with_its_reason(tmp_path
     assert res["subtype"] == "incomplete" and "big.bin" in res["reason"] and "limit" in res["reason"]
     assert (tmp_path / "ok.txt").read_bytes() == b"tiny" and not (tmp_path / "big.bin").exists()
     assert not list((tmp_path / ".harness" / "qoder").glob("*.part"))       # no download left behind
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes into a mode-0555 directory, so 'unwritable' cannot be made as root")
+def test_an_artifact_the_workspace_cannot_take_fails_with_its_reason(tmp_path, stub, monkeypatch):
     # a workspace the file cannot be written to: that artifact fails with the reason; the turn goes on
-    monkeypatch.delenv("HR_QODER_ARTIFACT_MAX_BYTES")
+    monkeypatch.delenv("HR_QODER_ARTIFACT_MAX_BYTES", raising=False)
+    stub.blobs["file_ok"] = b"tiny"
     ro = tmp_path / "ro"
     (ro / ".harness" / "qoder").mkdir(parents=True)
     ro.chmod(0o555)

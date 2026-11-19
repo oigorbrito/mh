@@ -176,41 +176,6 @@ async def idem_release(org: str, sha: str, resp_id: str) -> None:
 
 
 # ── per-session execution lease (fencing) ──────────────────────────────────────
-async def lease_acquire(org: str, sid: str, owner: str, ttl_s: int) -> int:
-    """Bump and take the session lease; returns THIS turn's fence token (monotonic
-    int). A newer turn will get a higher fence, so a stale turn detects it lost the
-    workspace at checkpoint time. Best-effort: returns 0 on contention exhaustion OR
-    any store error (the caller then behaves as today — no fencing, but the turn
-    still runs). NOTE: fencing is not yet wired into the turn path (deferred)."""
-    cex = _exceptions()
-    try:
-        cont = await _container()
-        doc_id = f"lease::{org}::{sid}"
-        for _ in range(5):                   # bounded CAS retry
-            try:
-                cur = await cont.read_item(doc_id, partition_key=_pk(org))
-                fence = int(cur.get("fence", 0)) + 1
-                cur.update(fence=fence, owner=owner, expires=time.time() + ttl_s,
-                           ts=time.time(), ttl=max(int(ttl_s) * 4, 3600))
-                await cont.replace_item(doc_id, cur,
-                                        etag=cur["_etag"], match_condition=_IF_MATCH)
-                return fence
-            except cex.CosmosResourceNotFoundError:
-                try:
-                    await cont.create_item({"id": doc_id, "pk": _pk(org), "kind": "lease",
-                                            "fence": 1, "owner": owner,
-                                            "expires": time.time() + ttl_s,
-                                            "ts": time.time(), "ttl": max(int(ttl_s) * 4, 3600)})
-                    return 1
-                except cex.CosmosResourceExistsError:
-                    continue                 # someone created it first — retry the read/bump
-            except cex.CosmosAccessConditionFailedError:
-                continue                     # ETag moved under us — retry
-        return 0                             # gave up (contention) → unfenced fallback
-    except Exception:                        # noqa: BLE001 — store down: fail open per docstring
-        return 0
-
-
 async def lease_admit(org: str, sid: str, owner: str, ttl_s: int, *,
                       reject_on_conflict: bool = False, fresh_s: float = 75.0) -> dict:
     """Admission gate at turn start. Reads the session lease and classifies the incumbent:
@@ -493,6 +458,7 @@ async def resp_is_cancelled(org: str, rid: str) -> bool:
             return False
         return str(cur.get("status")) == "cancelled"
     except Exception:
+        # A store error reads as "not cancelled": the accepted trade-off documented on _turn_cancelled (app.py).
         return False
 
 

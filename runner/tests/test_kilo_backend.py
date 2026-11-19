@@ -9,14 +9,12 @@ not a guess from docs:
   - the session store is SQLite `session(id TEXT PRIMARY KEY, directory, ...)` in
     $HOME/.local/share/kilo/kilo.db, and an unknown --session exits 1 with nothing on stdout.
 """
-import http.server
 import json
 import pathlib
 import socket
 import sqlite3
 import sys
 import tempfile
-import threading
 import urllib.error
 import urllib.request
 

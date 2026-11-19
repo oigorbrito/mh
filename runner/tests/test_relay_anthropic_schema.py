@@ -90,7 +90,6 @@ def test_a_nested_combinator_is_left_alone_because_anthropic_accepts_it():
 
 def test_both_wire_shapes_are_repaired_and_an_untouched_body_is_byte_identical():
     import json as _json
-    from server import _with_anthropic_schemas
     openai = _json.dumps({"model": "anthropic/claude-haiku-4.5", "messages": [],
                           "tools": [{"type": "function", "function": {"name": "use_tool",
                                                                      "parameters": USE_TOOL_SCHEMA}}]}).encode()
@@ -108,7 +107,6 @@ def test_both_wire_shapes_are_repaired_and_an_untouched_body_is_byte_identical()
 
 
 def test_the_family_test_reads_the_vendor_prefixed_id_and_the_bare_one():
-    from server import _anthropic_family
     for m in ("claude-haiku-4.5", "anthropic/claude-sonnet-4.6", "CLAUDE-OPUS-5"):
         assert _anthropic_family(m)
     for m in ("", "gemini-3.5-flash", "spacexai/grok-4.6", "gpt-5.4"):
@@ -122,7 +120,6 @@ def test_the_repair_is_idempotent_so_the_relays_retry_terminates():
     combinator), call 2 the answer (20 tools, root combinator at index 14) refused, call 3 the same
     request repaired and answered — one extra request, not a ladder."""
     import json as _json
-    from server import _with_anthropic_schemas
     body = _json.dumps({"model": "vendor/opus-x", "messages": [],
                         "tools": [{"type": "function", "function": {"name": "use_tool",
                                                                    "parameters": USE_TOOL_SCHEMA}}]}).encode()
