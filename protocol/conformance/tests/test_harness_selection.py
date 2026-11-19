@@ -4,7 +4,6 @@ installation without the schema is an error of the suite, never a skip that read
 from __future__ import annotations
 
 import json
-import socket
 import subprocess
 import sys
 import threading

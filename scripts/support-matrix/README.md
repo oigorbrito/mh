@@ -9,7 +9,7 @@ back), an artifact (a file the task must produce, checked on the transcript's fi
 recycle (the session's sandbox is let go on purpose through the internal recycle route, then a
 follow-up must recall the first message: the history survived the checkpoint round trip).
 Results are one JSON record per harness x model with the outcome, seconds and reason of each
-scenario; `fill-connection.py` stamps each record with the connection its session actually ran on;
+scenario; `fill-connection.py` stamps each record with the connection its session actually ran on (a results file it cannot read is named on stderr, left as it was, and makes the exit status 1, so a partial stamp is never taken for a complete one);
 `render.py` turns the records into `docs/support-matrix.md` (the Browser section at its end comes from docs/browser-column.json).
 
 ```

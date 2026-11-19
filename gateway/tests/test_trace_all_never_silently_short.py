@@ -66,8 +66,16 @@ def _trace(chunks: list[bytes], status: str = "done") -> tuple[str, str, list[st
 
 def _unreadable(tmp_path: Path, key: str) -> None:
     """The chunk's object is there, is LISTED, and cannot be read (EACCES, as EIO or EMFILE would
-    be): not the same thing as a chunk that is not there."""
+    be): not the same thing as a chunk that is not there. Root reads a mode-000 file, so this only
+    holds for a non-root run: see the skipif on the test that uses it."""
     (tmp_path / "blobs" / gw.TRACE_KB / key).chmod(0o000)
+
+
+def _unreadable_as_directory(tmp_path: Path, key: str) -> None:
+    """A directory stands where the chunk's file belongs: EISDIR on read, for any uid."""
+    p = tmp_path / "blobs" / gw.TRACE_KB / key
+    p.unlink()
+    p.mkdir()
 
 
 def test_a_whole_transcript_reads_back_whole(stores):
@@ -81,11 +89,29 @@ def test_a_whole_transcript_reads_back_whole(stores):
     assert len(api.get(f"/v1/traces/{sid}/all?compact=1").content.splitlines()) == 4
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 file, so EACCES cannot be made as root")
 def test_a_chunk_that_cannot_be_read_is_said_never_a_short_transcript(stores):
     tmp = stores
     chunks = [_event(0), _event(1), _event(2)]
     sid, base, keys = _trace(chunks)
     _unreadable(tmp, keys[1])
+    _assert_said_not_short(sid, base)
+
+
+# FINDING (gateway/backing.py FileBlobStore.list): the local store lists FILES only (os.walk), so a
+# directory where a chunk belongs is not listed, the join never asks for it, and the route answers
+# 200 with the transcript missing that chunk. Strict xfail: it turns into a failure once fixed, so the
+# marker is removed with the fix. Not fixed here: the listing feeds 14 callers.
+@pytest.mark.xfail(strict=True, reason="FINDING: a directory at a chunk's path is unlisted and the transcript is served short")
+def test_a_chunk_that_is_a_directory_is_said_never_a_short_transcript(stores):
+    tmp = stores
+    chunks = [_event(0), _event(1), _event(2)]
+    sid, base, keys = _trace(chunks)
+    _unreadable_as_directory(tmp, keys[1])
+    _assert_said_not_short(sid, base)
+
+
+def _assert_said_not_short(sid: str, base: str) -> None:
     r = TestClient(gw.app).get(f"/v1/traces/{sid}/all")
     assert r.status_code == 503, f"{r.status_code} {r.content!r}"
     err = r.json()["error"]

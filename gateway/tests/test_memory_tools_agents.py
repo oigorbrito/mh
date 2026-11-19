@@ -4,7 +4,6 @@ for nothing in particular (an agent listing what it holds), and a record named b
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import sys
 

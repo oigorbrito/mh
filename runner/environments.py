@@ -383,10 +383,6 @@ def delete_path(env_id: str, rel: str) -> dict:
     return {"path": rel.strip("/"), "deleted": True}
 
 
-def _members_zip(zf: zipfile.ZipFile) -> list[tuple[str, bool, int]]:
-    return [(i.filename, i.is_dir(), i.file_size) for i in zf.infolist()]
-
-
 def _strip_common_root(names: list[str]) -> str:
     """GitHub's archives and most folder zips wrap everything in one directory; the project is
     what is inside it. The common first segment, when EVERY entry has the same one and nothing sits
@@ -1272,13 +1268,6 @@ def apply_env(env: dict, applied: dict | None) -> None:
         env["LD_LIBRARY_PATH"] = ":".join(libs + ([env["LD_LIBRARY_PATH"]] if env.get("LD_LIBRARY_PATH") else []))
     if path_add:
         env["PATH"] = ":".join(path_add + [env.get("PATH", "")])
-
-
-def apply_to_turn(env: dict, spec: dict | None) -> dict | None:
-    """resolve + apply_env in one call, for a caller that has no doc to write first."""
-    applied = resolve(spec)
-    apply_env(env, applied)
-    return applied
 
 
 def doc_section(applied: dict | None) -> list[str]:

@@ -24247,13 +24247,6 @@ async def _plugins_prepare(body: HarnessBody, org: str, previous: list[dict] | N
     return out
 
 
-async def _plugins_discard(org: str, v: dict | None) -> None:
-    """Delete the packages of a harness being deleted."""
-    for pe in _plugins_of(v):
-        if pe.get("blob"):
-            await _blob_delete(_plugin_blob_key(org, str(pe["blob"])), kb=BLOB_KB)
-
-
 def _plugin_export_name(v: dict) -> str:
     """Plugins §5: the harness name as a plugin name, or the id when nothing usable remains."""
     def derive(s: str) -> str:

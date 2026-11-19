@@ -10,13 +10,27 @@ def session(sid):
         return json.loads(urllib.request.urlopen(req, timeout=60, context=CTX).read().decode())
     except Exception as e:  # noqa: BLE001
         print(sid, "not read:", str(e)[:80]); return {}
+failed = []
 for path in sys.argv[1:]:
-    try: res = json.load(open(path))
-    except Exception: continue
+    # A file that cannot be read is named and skipped, never silently: the run's matrix is then incomplete,
+    # and the exit status says so.
+    try:
+        with open(path) as f: res = json.load(f)
+    except (OSError, ValueError) as e:
+        print(path, "not read, skipped:", str(e)[:120], file=sys.stderr); failed.append(path); continue
     n = 0
     for k, r in res.items():
         sid = r.get("sid")
         if not sid or r.get("connection"): continue
         v = session(sid).get("last_connection") or ""
         if v: r["connection"] = v; n += 1
-    json.dump(res, open(path, "w"), indent=1); print(path, "stamped", n)
+    # Written beside the file and moved over it, so an interrupted or failed write leaves the original as it was.
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w") as f: json.dump(res, f, indent=1)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp): os.remove(tmp)
+        raise
+    print(path, "stamped", n)
+sys.exit(1 if failed else 0)

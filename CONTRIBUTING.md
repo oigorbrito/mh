@@ -87,10 +87,32 @@ npm test
 npm run build
 ```
 
-For the gateway:
+For the gateway, the runner, the protocol conformance suite and the integration tests, these are the
+commands `.github/workflows/tests.yml` runs, so run the ones for the area you changed:
 
 ```bash
+pip install -r gateway/requirements.txt pytest pytest-asyncio jsonschema
 python -m pytest gateway/tests
+python -m pytest scripts/benchmark
+python -m pytest scripts/support-matrix/memories
+```
+
+```bash
+pip install -r runner/requirements.txt pytest pytest-asyncio httpx
+python -m pytest runner/tests
+```
+
+Tests for an optional agent driver skip when that driver's package is not installed; CI installs the
+pinned versions listed in `tests.yml`.
+
+```bash
+pip install -r gateway/requirements.txt -r runner/requirements.txt pytest pytest-asyncio httpx
+python -m pytest tests/integration
+```
+
+```bash
+pip install -e protocol/conformance pytest
+python -m pytest protocol/conformance/tests
 ```
 
 For container-level changes, build the image and walk the documented self-hosted flow before

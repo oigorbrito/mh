@@ -25,8 +25,7 @@ import tempfile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from server import (ALL_VIBE_TOOLS, Auth, BACKENDS,  # noqa: E402
-                    CHECKPOINT_EXCLUDE, _PRODUCED_EXCLUDE_PREFIX,
-                    _agent_doc_path, _build_vibe,
+                    CHECKPOINT_EXCLUDE, _agent_doc_path, _build_vibe,
                     _BRIDGED_TRANSPORTS, _vibe_eof, _vibe_home, _vibe_out,
                     _vibe_session_present, _vibe_to_claude, _resume_lost, _write_skills,
                     ALL_DOCKER_AGENT_TOOLS, _build_docker_agent, _docker_agent_eof,

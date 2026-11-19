@@ -2,7 +2,6 @@
 opens it: refused before any socket when the address text can't be used, and at the socket (_CheckedNetwork) when its
 name resolves inside this deployment's networks, so a name that rebinds can't slip between a check and the connect. The
 operator's own integrations and a single-operator install are unchanged."""
-import os
 import socket
 import sys
 from pathlib import Path

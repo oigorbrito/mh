@@ -345,7 +345,10 @@ def test_a_deleted_environment_frees_its_path_keeps_its_files_30_days_then_goes(
     run(gw.delete_environment(eid, _Req()))
     calls.clear()
     assert eid in _sweep(gw._now_ms() + 30 * DAY + 1000, kinds=["environments"])["removed"]["environments"]
-    assert calls == [("DELETE", f"/environments/{eid}", "")]             # never the name: it may be another's
+    # The sweep also takes any other environment that is due (one a test earlier in the run left deleted),
+    # so this checks this one's removal by its id, and that no removal anywhere names a slug.
+    assert [c for c in calls if c[1] == f"/environments/{eid}"] == [("DELETE", f"/environments/{eid}", "")]  # once, by id
+    assert all(slug_arg == "" for _, _, slug_arg in calls)              # never the name: it may be another's
     assert run(gw.BACKING.graph.get(eid)) is None
 
 

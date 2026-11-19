@@ -1,5 +1,4 @@
 """Real runner process; only the paid Claude executable is replaced with a local fixture."""
-import json
 import os
 from pathlib import Path
 import sys
