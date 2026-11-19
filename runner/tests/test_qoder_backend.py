@@ -1207,6 +1207,7 @@ def test_an_artifact_over_the_limit_or_unwritable_fails_with_its_reason(tmp_path
 def test_an_artifact_the_workspace_cannot_take_fails_with_its_reason(tmp_path, stub, monkeypatch):
     # a workspace the file cannot be written to: that artifact fails with the reason; the turn goes on
     monkeypatch.delenv("HR_QODER_ARTIFACT_MAX_BYTES", raising=False)
+    stub.blobs["file_ok"] = b"tiny"
     ro = tmp_path / "ro"
     (ro / ".harness" / "qoder").mkdir(parents=True)
     ro.chmod(0o555)
