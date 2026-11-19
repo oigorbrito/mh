@@ -66,7 +66,7 @@ def relevant(item: dict) -> bool:
     return bool(RELEVANT.search(text))
 
 def source_kind(item: dict) -> str:
-    return "pr" if "pull_request" in item else "issue"
+    return "pr" if item.get("_kind") == "pr" or "pull_request" in item else "issue"
 
 def marker(item: dict) -> str:
     return f"<!-- upstream-sync: {UPSTREAM}#{item['number']} {source_kind(item)} -->"
@@ -102,8 +102,13 @@ For upstream PRs, this issue tracks the proposal/change; it does **not** import 
     return title, body
 
 def main() -> int:
-    upstream_issues = all_pages(f"/repos/{UPSTREAM}/issues?state=all")
+    upstream_issues = [
+        item for item in all_pages(f"/repos/{UPSTREAM}/issues?state=all")
+        if "pull_request" not in item
+    ]
     upstream_prs = all_pages(f"/repos/{UPSTREAM}/pulls?state=all")
+    for item in upstream_prs:
+        item["_kind"] = "pr"
     sources = upstream_issues + upstream_prs
 
     local = all_pages(f"/repos/{TARGET}/issues?state=all")
