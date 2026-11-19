@@ -102,6 +102,15 @@ For upstream PRs, this issue tracks the proposal/change; it does **not** import 
     return title, body
 
 def main() -> int:
+    repository = request("GET", f"/repos/{TARGET}")
+    if not repository.get("has_issues", False):
+        print(json.dumps({
+            "upstream": UPSTREAM,
+            "target": TARGET,
+            "blocked": "GitHub Issues is disabled for this repository. Enable Settings > General > Features > Issues to activate the mirror.",
+        }, indent=2))
+        return 0
+
     upstream_issues = [
         item for item in all_pages(f"/repos/{UPSTREAM}/issues?state=all")
         if "pull_request" not in item
