@@ -248,9 +248,25 @@ _INTERRUPTED_MESSAGE = ("This task stopped before it finished because the servic
 _CAP_MESSAGE = "This task did not finish within its time limit. Start a new turn to continue."
 
 
-def _interrupted_error() -> dict:
+def _interrupted_error(workspace: str | None = None) -> dict:
+    """The error of a turn this server cut short. With `workspace` (kept, checkpoint or lost) it also
+    says, in fields a client can act on, what the interruption left behind and that the step running
+    when it came may run again: a checkpoint cannot tell whether a tool's outside effect happened, so
+    it is always true here (Tasks §3.3). Without it, as a record from before carried it, only the reason."""
+    detail: dict = {"reason": "interrupted"}
+    if workspace:
+        detail.update({"workspace": workspace, "effects_may_repeat": True})
     return {"type": "harness_error", "code": "harness_error", "message": _INTERRUPTED_MESSAGE,
-            "detail": {"reason": "interrupted"}}
+            "detail": detail}
+
+
+def _interrupted_workspace(v: dict) -> str:
+    """What a cut turn left of its working directory, from the session's record `v`: `kept` where the
+    directory is a volume that outlives a restart (#530), and where it is a checkpoint tarball (the vg
+    backing) `checkpoint` when one was saved (a step's, #634, or a turn's end) and `lost` when none ever was."""
+    if BACKING.mode != "vg":
+        return "kept"
+    return "checkpoint" if str((v or {}).get("ws_sha") or "") else "lost"
 
 
 def _cap_error() -> dict:
@@ -282,7 +298,11 @@ async def _settle_drained(persist, tr, emit, end: dict | None = None) -> None:
         except Exception:  # noqa: BLE001
             pass
         return
-    err = _interrupted_error()
+    v: dict = {}
+    if getattr(tr, "sid", None):
+        with contextlib.suppress(Exception):
+            v = await _vertex_get(tr.sid) or {}
+    err = _interrupted_error(_interrupted_workspace(v))
     try:
         for ev in tr.fail(err["message"], err):
             await emit(ev)
@@ -2846,10 +2866,15 @@ async def _hydrate(sid: str, rec: dict, force: bool = False) -> None:
         # checkpoint (sha marker kept by the runner), skip the blob download and the full
         # wipe+untar — the dominant cost of every follow-up turn on a big workspace.
         want_sha = str(v.get("ws_sha") or "")
-        if want_sha and not force:
+        if not force:
+            # A session that never saved a checkpoint is asked about its fresh start (#712): its first
+            # turn, cut by a restart before the end-of-turn checkpoint, left files and the CLI's
+            # conversation in a workspace the restart kept (its error says `kept`), and restoring
+            # "nothing" over them wiped both. A new session has no such workspace, so the probe misses
+            # and the empty restore below starts it as before.
             try:
                 pr = await _sandbox("/hydrate", sid, "POST", content=b"",
-                                    params={"probe": want_sha})
+                                    params={"probe": want_sha or "fresh"})
                 pj = pr.json() if pr.headers.get("content-type", "").startswith("application/json") else {}
                 if pr.status_code < 400 and pj.get("skipped"):
                     rec["hydrated"] = True
@@ -3823,7 +3848,8 @@ async def _reconcile_response(rid: str, rec: dict) -> dict:
     rec["status"] = settled
     if settled == "failed" and vs == "failed" and proven:
         # the sweep proved why (a restart lost the turn, or the hard cap) and wrote it on the session
-        rec["error"] = _interrupted_error() if v["end_reason"] == "interrupted" else _cap_error()
+        rec["error"] = (_interrupted_error(_interrupted_workspace(v)) if v["end_reason"] == "interrupted"
+                        else _cap_error())
     elif settled == "failed" and capped and not rec.get("error"):
         rec["error"] = _cap_error()                # the reconciler's own hard cap: never a bare failed
     try:
@@ -5211,7 +5237,12 @@ def _provider_refused(err: str) -> bool:
     the first line only: that is the line the runner chose as the provider's answer, and a
     diagnostic further down (a retry, a JSON body, an earlier label) must not turn a Codex
     compaction failure or a bad request into "your key was refused"."""
-    return bool(_PROVIDER_REFUSAL_RE.search((err or "").split("\n", 1)[0]))
+    first = (err or "").split("\n", 1)[0]
+    # A 401 from the runner's own MCP relay (an address under /hr-mcp-) is not the provider refusing the
+    # key: OpenHands' follow-ups read "Your vercel key was refused" over the relay's "unknown relay token" (#714).
+    if "/hr-mcp-" in first:
+        return False
+    return bool(_PROVIDER_REFUSAL_RE.search(first))
 
 
 # A Responses provider refusing a replayed history: OpenAI's encrypted reasoning items are opened
@@ -5758,6 +5789,11 @@ UHP_CAPABILITIES = {
     # response's committed files and transcript (_branch_source, _branch_prepare). Optional at every
     # class (VERSIONING: within a version only optional things are added), so it is a capability.
     "session_branching": True,
+    # Tasks §3.3: a `resume` item in `input`, chained on a response this server itself cut short
+    # (a restart, a shutdown drain), continues the session and tells the harness it was cut off
+    # (_split_resume, _resume_prompt). A continuation like any other, so every base has it; the
+    # base's own resume applies where it has one.
+    "resume": True,
 }
 UHP_CONFORMANCE_CLASS = "full"
 # The bases the runner serves `ask_user` to and ends a turn at its call (runner/ask_user_mcp.py).
@@ -8189,6 +8225,114 @@ def _answer_prompt(acc: dict, secret_env: str | None) -> str:
     return f'Answer to your question {q}: {answer}'
 
 
+# ── resuming a turn the server cut short (Tasks §3.3, capability resume) ───────────────────────
+def _split_resume(inp) -> dict | None:
+    """The one `resume` item a request may carry. It stands alone in `input`: another item beside
+    it, a second resume, a note that is not text, or an input_response too is a malformed body (400),
+    and a server without the capability refuses the item rather than read it as an empty task."""
+    if not isinstance(inp, list):
+        return None
+    found = [it for it in inp if isinstance(it, dict) and it.get("type") == "resume"]
+    if not found:
+        return None
+    if not UHP_CAPABILITIES.get("resume"):
+        raise uhp_error(400, "invalid_input", "This server does not support resume.", "input")
+    if len(found) > 1 or len(inp) > 1:
+        raise uhp_error(400, "invalid_input", "A resume is the only item of its request.", "input")
+    note = found[0].get("note")
+    if note is not None and not isinstance(note, str):
+        raise uhp_error(400, "invalid_input", "A resume's note is text.", "input.note")
+    return found[0]
+
+
+def _is_interrupted(rec: dict | None) -> bool:
+    """Whether this stored response is one the server itself cut short: `failed`, its error's reason
+    `interrupted` (a budget stop, a hard cap or a failure of the task's own is none of them)."""
+    if not isinstance(rec, dict) or str(rec.get("status") or "") != "failed":
+        return False
+    err = rec.get("error")
+    detail = err.get("detail") if isinstance(err, dict) else None
+    return isinstance(detail, dict) and detail.get("reason") == "interrupted"
+
+
+_RESUME_WORKSPACE = {
+    "kept": "Your working files are as you left them.",
+    "checkpoint": "Your working files are back at the last saved step; what you did after it is gone.",
+    "lost": "Your working files did not survive; you have this conversation only.",
+}
+
+
+_RESUME_REQUEST_MAX = 4000      # characters of the cut turn's request repeated in a resume's instruction
+
+
+def _interrupted_request(rec: dict) -> str:
+    """The words of the request the cut turn was running, from its own record (`_input`, the way a
+    branch reads its history). A harness whose conversation did not survive needs them to know what it
+    was doing: a session's first turn cut before its CLI kept any of it (seen live: the runner could not
+    restore the session and said so), or a `lost` workspace, which takes the CLI's conversation with it."""
+    parts: list[str] = []
+    for item in rec.get("_input") or []:
+        content = item.get("content") if isinstance(item, dict) else None
+        if isinstance(content, str):
+            parts.append(content)
+        elif isinstance(content, list):
+            parts.extend(str(p.get("text") or "") for p in content
+                         if isinstance(p, dict) and p.get("type") == "input_text")
+    text = "\n".join(x for x in parts if x.strip()).strip()
+    return text if len(text) <= _RESUME_REQUEST_MAX else text[:_RESUME_REQUEST_MAX].rstrip() + " …"
+
+
+def _resume_prompt(rec: dict, note: str | None) -> str:
+    """The server's own instruction for a resumed turn, for a base that has no native resume to say
+    it for it: that the last turn was cut off, what survived, that the step that was running may run
+    again, and the request it was running, since the conversation may not have survived with it. The
+    person's note follows as theirs."""
+    detail = ((rec.get("error") or {}).get("detail") or {}) if isinstance(rec.get("error"), dict) else {}
+    lines = ["Your previous turn was cut off before it finished, because the service running it restarted.",
+             _RESUME_WORKSPACE.get(str(detail.get("workspace") or ""), "")]
+    if detail.get("effects_may_repeat", True):
+        lines.append("The step you were on may run again, so check what it already did before you "
+                     "repeat anything with an outside effect.")
+    lines.append("Carry on from where you stopped.")
+    text = " ".join(x for x in lines if x)
+    request = _interrupted_request(rec)
+    if request:
+        text += f'\n\nThe request you were working on was: "{request}"'
+    return f'{text}\n\nThe person says: "{note}"' if note else text
+
+
+_RESUME_CLAIMED: dict[str, float] = {}      # response id -> when this process claimed its resume
+_RESUME_CLAIMED_MAX = 4096
+
+
+async def _resume_claim(org: str, prev_id: str) -> bool:
+    """Claim the resume of `prev_id`, once: the first caller gets True and any other False (→ 409
+    resume_not_pending). Within this process the check and the set are one step with no await between
+    them, so two resumes that arrive together cannot both pass; across replicas the control store's
+    compare-and-swap decides it (resp_claim_resume), and a store that cannot decide refuses the resume
+    (503) rather than run the turn twice."""
+    if prev_id in _RESUME_CLAIMED:
+        return False
+    _RESUME_CLAIMED[prev_id] = time.time()
+    while len(_RESUME_CLAIMED) > _RESUME_CLAIMED_MAX:
+        _RESUME_CLAIMED.pop(next(iter(_RESUME_CLAIMED)), None)
+    if control_store.enabled():
+        try:
+            return await control_store.resp_claim_resume(org, prev_id, _INPUT_REQUEST_TTL_S)
+        except Exception as e:  # noqa: BLE001
+            _RESUME_CLAIMED.pop(prev_id, None)
+            raise HTTPException(503, "resume store unavailable; retry") from e
+    return True
+
+
+async def _resume_release(org: str, prev_id: str) -> None:
+    """Give the claim back when the turn it was for never ran, so the client's retry can resume."""
+    _RESUME_CLAIMED.pop(prev_id, None)
+    if control_store.enabled():
+        with contextlib.suppress(Exception):
+            await control_store.resp_claim_resume(org, prev_id, _INPUT_REQUEST_TTL_S, release=True)
+
+
 # ── a new task's earlier turns (Tasks §2.1, capability input_history) ───────────────────────────
 # A task may start from a conversation held elsewhere: the console continues a recorded demo task as
 # the person's own by sending the recording's request and answer as earlier messages, then the new
@@ -8398,6 +8542,8 @@ _VENDOR_MODELS: dict[str, dict[str, str]] = {
         "claude-haiku-4.5":  "us.anthropic.claude-haiku-4-5-20251001-v1:0",
     },
     "openai": {
+        "gpt-6.2-astra": "gpt-6.2-astra",
+        "gpt-6.2-sol":   "gpt-6.2-sol",
         "gpt-6-astra":   "gpt-6-astra",
         "gpt-6.1-sol":     "gpt-6.1-sol",
         "gpt-6-sol":     "gpt-6-sol",
@@ -8412,6 +8558,8 @@ _VENDOR_MODELS: dict[str, dict[str, str]] = {
         "gpt-5.3-codex": "gpt-5.3-codex",
     },
     "azure-foundry": {
+        "gpt-6.2-astra": "gpt-6.2-astra",
+        "gpt-6.2-sol":   "gpt-6.2-sol",
         "gpt-6-astra":   "gpt-6-astra",
         "gpt-6.1-sol":     "gpt-6.1-sol",
         "gpt-6-sol":     "gpt-6-sol",
@@ -8426,6 +8574,8 @@ _VENDOR_MODELS: dict[str, dict[str, str]] = {
         "gpt-5.3-codex": "gpt-5.3-codex",
     },
     "openrouter": {
+        "gpt-6.2-astra":      "openai/gpt-6.2-astra",
+        "gpt-6.2-sol":        "openai/gpt-6.2-sol",
         "gpt-6-astra":        "openai/gpt-6-astra",
         "gpt-6.1-sol":          "openai/gpt-6.1-sol",
         "gpt-6-sol":          "openai/gpt-6-sol",
@@ -8574,6 +8724,8 @@ _VENDOR_MODELS: dict[str, dict[str, str]] = {
     # and reachable through openrouter, tokenrouter and vercel. Left alone here rather than
     # worked around in one vendor's table.
     "llmtr": {
+        "gpt-6.2-astra":      "openai/gpt-6.2-astra",
+        "gpt-6.2-sol":        "openai/gpt-6.2-sol",
         "gpt-6-astra":        "openai/gpt-6-astra",
         "gpt-6.1-sol":          "openai/gpt-6.1-sol",
         "gpt-6-sol":          "openai/gpt-6-sol",
@@ -8786,7 +8938,10 @@ _OPENROUTER_RESLUG = {
 # confirmed it, and answer since. A user whose own OpenRouter account has not confirmed sees the
 # same 403 on send. (llama-4-scout is not in the catalog at all: OpenRouter has no endpoint for it
 # and on Vercel seven of eight harnesses failed its artifact or recall scenario twice.)
-_OPENROUTER_NO_CHANNEL: set[str] = set()
+# 2026-11-20: OpenRouter's /v1/models no longer lists x-ai/grok-build-0.1 (its Grok ids are
+# grok-4.7, 4.6, 4.5, 4.3, 4.20 and 4.20-multi-agent); xAI itself and Vercel (spacexai/) still
+# serve it, so it stays in the catalog and only comes off OpenRouter's table.
+_OPENROUTER_NO_CHANNEL = {"grok-build-0.1"}
 _VENDOR_MODELS["openrouter"] = {c: _OPENROUTER_RESLUG.get(c, v) for c, v in _SHARED_SLUGS.items()
                                 if c not in _OPENROUTER_NO_CHANNEL}
 # System One models. TypeSafe's Jev is a decision model (typed answers with probabilities, no text)
@@ -8892,8 +9047,8 @@ _VENDOR_MODELS["google"] = {m: m for m in ("gemini-4-argon", "gemini-3.8-flash",
 # order it was written. Add a new model to its family here, not at the end of a catalog.
 _MODEL_ORDER: tuple[str, ...] = (
     # OpenAI
-    "gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4",
-    "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.2",
+    "gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+    "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.2",
     # Anthropic
     "claude-fable-5-2", "claude-fable-5-1", "claude-fable-5", "claude-opus-5.5", "claude-opus-5", "claude-sonnet-5.5", "claude-sonnet-5", "claude-opus-4.8",
     "claude-opus-4.7", "claude-sonnet-4.6", "claude-haiku-5.5", "claude-haiku-4.5",
@@ -9052,6 +9207,19 @@ _MODEL_CATALOG: dict[str, dict] = {
     # of twelve); aider (no function tools) and goose run it on every connection. As with the gpt-5.6 line on
     # qwen and cline, a row measured working on a path stays listed and the comment names the
     # channel; no base refused it on every connection. Not RESPONSES_ONLY: aider runs it.
+    #
+    # gpt-6.2-astra and gpt-6.2-sol (both released 2026-11-17: OpenAI's pricing page, Vercel's
+    # changelog and OpenRouter's model pages, read the same day): astra is the line's most capable
+    # model, for hard projects; sol is the everyday one. openai and azure-foundry name them
+    # `gpt-6.2-astra` and `gpt-6.2-sol`, openrouter, tokenrouter, vercel and llmtr `openai/<id>`; the
+    # -fast variants are not offered. List prices, no markup (OpenAI's pricing page, read 2026-11-17,
+    # Standard; per 1M tokens, 30-minute cache write): gpt-6.2-astra $8 in / $40 out, cached $0.40,
+    # cache write $10, and above 272k prompt tokens $16 / $60, cached $0.80, cache write $20;
+    # gpt-6.2-sol $2 in / $10 out, cached $0.10, cache write $2.50, and above 272k prompt tokens
+    # $4 / $15, cached $0.20, cache write $5, as gpt-6.1-sol. NOT YET MEASURED: each is a candidate placed exactly
+    # where its predecessor is, gpt-6.2-astra beside gpt-6-astra (the Responses bases,
+    # RESPONSES_ONLY_MODELS) and gpt-6.2-sol beside gpt-6.1-sol (every base that offers it, the same
+    # channel refusals and exclusions), newest first; no default changed. Real turns prune them.
     # gpt-6-sol and gpt-6-luna (2026-09-27: OpenAI's pricing page, Azure's catalog at model version
     # 2026-09-22 and deployed on our resource that day, openrouter, tokenrouter, vercel and llmtr as
     # `openai/<id>`, all read the same day; no provider lists a gpt-6-terra) are the line's sol and
@@ -9063,7 +9231,7 @@ _MODEL_CATALOG: dict[str, dict] = {
     # $0.20; luna $0.10 / $0.50, cached $0.01; astra $10 / $50, cached $1; all doubled above
     # 272k prompt tokens as the gpt-5.x line is.
     "codex":  {"default": "gpt-6.1-sol",
-               "models": ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
+               "models": ["gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
                           "gpt-5.4", "gpt-5.4-mini", "gpt-5.2",
                           # Codex-optimized line (separate from the general one; 5.3-codex is
                           # OpenAI's most capable agentic coding model, there is no 5.6-codex).
@@ -9080,7 +9248,7 @@ _MODEL_CATALOG: dict[str, dict] = {
     # (2026-07-21: gpt-5.5 via azure-foundry + opus-4.8/haiku-4.5 via Bedrock probe-verified
     # through the hermes CLI).
     "hermes": {"default": "gpt-6.1-sol",
-               "models": ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
+               "models": ["gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
                           "gpt-5.4", "gpt-5.4-mini", "gpt-5.2",
                           "gpt-5.3-codex",
                           "claude-opus-5.5", "claude-opus-5", "claude-fable-5", "claude-fable-5-2", "claude-fable-5-1", "claude-opus-4.8", "claude-sonnet-5.5", "claude-sonnet-5",
@@ -9114,7 +9282,7 @@ _MODEL_CATALOG: dict[str, dict] = {
     # and the frontier set was probed per-model through the dsh driver (2026-08-20).
     "dsh": {"default": "deepseek-v4-pro",
             "models": ["deepseek-v4-pro", "deepseek-v4-flash",
-                       "gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
+                       "gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
                        "gpt-5.4", "gpt-5.4-mini", "gpt-5.2", "gpt-5.3-codex",
                        "claude-opus-5.5", "claude-opus-5", "claude-fable-5", "claude-fable-5-2", "claude-fable-5-1", "claude-opus-4.8", "claude-sonnet-5.5", "claude-sonnet-5",
                        "claude-opus-4.7", "claude-sonnet-4.6", "claude-haiku-5.5", "claude-haiku-4.5",
@@ -9130,7 +9298,7 @@ _MODEL_CATALOG: dict[str, dict] = {
     # turn, which is what the bar at the top of this table asks for. Probe before relying on any
     # single row here.
     "opencode": {"default": "gpt-6.1-sol",
-                 "models": ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
+                 "models": ["gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
                             "gpt-5.4", "gpt-5.4-mini", "gpt-5.2", "gpt-5.3-codex",
                             "claude-opus-5.5", "claude-opus-5", "claude-fable-5", "claude-fable-5-2", "claude-fable-5-1", "claude-opus-4.8", "claude-sonnet-5.5", "claude-sonnet-5",
                             "claude-opus-4.7", "claude-sonnet-4.6", "claude-haiku-5.5", "claude-haiku-4.5",
@@ -9165,7 +9333,7 @@ _MODEL_CATALOG: dict[str, dict] = {
     # was never asked for), while every other base held the conversation. Re-measure before adding it.
     "aider": {"default": "gpt-6.1-sol",
               "models": [
-                  "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4",
+                  "gpt-6.2-sol", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4",
                   "gpt-5.4-mini", "gpt-5.2", "claude-fable-5-2", "claude-fable-5-1", "claude-fable-5", "claude-opus-5.5", "claude-opus-5",
                   "claude-sonnet-5.5", "claude-sonnet-5", "claude-opus-4.8", "claude-opus-4.7", "claude-sonnet-4.6",
                   "claude-haiku-4.5", "gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash",
@@ -9191,7 +9359,7 @@ _MODEL_CATALOG: dict[str, dict] = {
     # a stub), so the gemini resolveModel class of silent substitution is absent.
     "kimi": {"default": "kimi-k3",
              "models": [
-                 "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4",
+                 "gpt-6.2-sol", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4",
                  "gpt-5.4-mini", "gpt-5.2", "claude-fable-5-2", "claude-fable-5-1", "claude-fable-5", "claude-opus-5.5", "claude-opus-5",
                  "claude-sonnet-5.5", "claude-sonnet-5", "claude-opus-4.8", "claude-opus-4.7", "claude-sonnet-4.6",
                  "claude-haiku-5.5", "claude-haiku-4.5", "gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash",
@@ -9222,7 +9390,7 @@ _MODEL_CATALOG: dict[str, dict] = {
     "minimax": {"default": "minimax-m3",
                 "models": [
                     "minimax-m3.1-flash", "minimax-m3",
-                    "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4",
+                    "gpt-6.2-sol", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4",
                     "gpt-5.4-mini", "gpt-5.2", "claude-fable-5-2", "claude-fable-5-1", "claude-fable-5", "claude-opus-5.5", "claude-opus-5",
                     "claude-sonnet-5.5", "claude-sonnet-5", "claude-opus-4.8", "claude-opus-4.7", "claude-sonnet-4.6",
                     "claude-haiku-5.5", "claude-haiku-4.5", "gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash",
@@ -9243,7 +9411,7 @@ _MODEL_CATALOG: dict[str, dict] = {
     "grok": {"default": "grok-4.6",
              "models": [
                  "grok-4.6", "grok-4.5", "grok-4.3", "grok-4.20", "grok-build-0.1",
-                 "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4",
+                 "gpt-6.2-sol", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4",
                  "gpt-5.4-mini", "gpt-5.2", "claude-fable-5-2", "claude-fable-5-1", "claude-fable-5", "claude-opus-5.5", "claude-opus-5",
                  "claude-sonnet-5.5", "claude-sonnet-5", "claude-opus-4.8", "claude-opus-4.7", "claude-sonnet-4.6",
                  "claude-haiku-5.5", "claude-haiku-4.5", "gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash",
@@ -9265,7 +9433,7 @@ _MODEL_CATALOG: dict[str, dict] = {
     # and was refused; the gpt-6 tokenrouter column found it (runner/server.py, _build_openhands).
     "openhands": {"default": "gpt-5.4",
                   "models": [
-                      "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4",
+                      "gpt-6.2-sol", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4",
                       "gpt-5.4-mini", "gpt-5.2", "claude-fable-5-2", "claude-fable-5-1", "claude-fable-5", "claude-opus-5.5", "claude-opus-5",
                       "claude-sonnet-5.5", "claude-sonnet-5", "claude-opus-4.8", "claude-opus-4.7", "claude-sonnet-4.6",
                       "claude-haiku-5.5", "claude-haiku-4.5", "gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash",
@@ -9284,7 +9452,7 @@ _MODEL_CATALOG: dict[str, dict] = {
     # (the runner sends `custom/<id>`, and providers.py strips the prefix before the request).
     "cheetahclaws": {"default": "gpt-5.4",
                      "models": [
-                         "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4",
+                         "gpt-6.2-sol", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4",
                          "gpt-5.4-mini", "gpt-5.2", "claude-fable-5-2", "claude-fable-5-1", "claude-fable-5", "claude-opus-5.5",
                          "claude-opus-5", "claude-sonnet-5.5", "claude-sonnet-5", "claude-opus-4.8", "claude-opus-4.7",
                          "claude-sonnet-4.6", "claude-haiku-5.5", "claude-haiku-4.5", "gemini-3.8-flash", "gemini-3.7-flash",
@@ -9316,7 +9484,7 @@ _MODEL_CATALOG: dict[str, dict] = {
     "agentzero": {"default": "gpt-6.1-sol", "models": []},
     "qwen": {"default": "qwen3.7-max",
              "models": ["qwen3.7-max", "qwen3.8-max",
-                        "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
+                        "gpt-6.2-sol", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
                         "gpt-5.4", "gpt-5.4-mini", "gpt-5.2",
                         "claude-opus-5.5", "claude-opus-5", "claude-fable-5", "claude-fable-5-2", "claude-fable-5-1", "claude-opus-4.8", "claude-sonnet-5.5", "claude-sonnet-5",
                         "claude-opus-4.7", "claude-sonnet-4.6", "claude-haiku-5.5", "claude-haiku-4.5",
@@ -9338,7 +9506,7 @@ _MODEL_CATALOG: dict[str, dict] = {
     # see every agent turn fail, not an edge case. Same trap class as _TOKENROUTER_NO_CHANNEL:
     # the CHANNEL decides, not the model.
     "cline": {"default": "gpt-5.4",
-              "models": ["gpt-5.4", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+              "models": ["gpt-5.4", "gpt-6.2-sol", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
                          "gpt-5.5", "gpt-5.4-mini", "gpt-5.2", "claude-opus-5.5", "claude-opus-5",
                          "claude-fable-5", "claude-fable-5-2", "claude-fable-5-1", "claude-opus-4.8", "claude-sonnet-5.5", "claude-sonnet-5", "claude-opus-4.7",
                          "claude-sonnet-4.6", "claude-haiku-5.5", "claude-haiku-4.5", "deepseek-v4-pro", "deepseek-v4-flash",
@@ -9348,7 +9516,7 @@ _MODEL_CATALOG: dict[str, dict] = {
                           "gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-4-argon", "gemini-3.1-pro-preview", "gemini-3-flash-preview",
                           "deepseek-v4.1-flash", "qwen3.8-flash", "qwen3.8-27b", "qwen3.7-plus", "hunyuan-4-preview", "nemotron-3.5-lightning", "nemotron-3-super", "grok-4.6", "grok-4.5", "grok-4.3", "grok-4.20", "grok-build-0.1", "muse-wonder-1.0", "muse-spark-1.3", "muse-spark-1.2", "muse-spark-1.1", "muse-glimmer-30b", "llama-4-maverick", "llama-3.3-70b"]},
     "pi": {"default": "gpt-6.1-sol",
-           "models": ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
+           "models": ["gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
                       "gpt-5.4", "gpt-5.4-mini", "gpt-5.2", "gpt-5.3-codex",
                       "claude-opus-5.5", "claude-opus-5", "claude-fable-5", "claude-fable-5-2", "claude-fable-5-1", "claude-opus-4.8", "claude-sonnet-5.5", "claude-sonnet-5",
                       "claude-opus-4.7", "claude-sonnet-4.6", "claude-haiku-5.5", "claude-haiku-4.5",
@@ -9418,7 +9586,7 @@ _MODEL_CATALOG: dict[str, dict] = {
               # 2026-09-12; the aggregators forward that answer unchanged, so every column showed it (0 of 8
               # artifact/recall checks). The other Claude ids continue such a history. The Responses-only
               # ids stay out: goose is chat-only.
-              "models": ["gpt-5.4", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
+              "models": ["gpt-5.4", "gpt-6.2-sol", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
                          "gpt-5.4-mini", "gpt-5.2",
                          "claude-fable-5", "claude-fable-5-2", "claude-fable-5-1", "claude-opus-4.8",
                          "claude-sonnet-5.5", "claude-sonnet-5", "claude-opus-4.7", "claude-sonnet-4.6", "claude-haiku-5.5", "claude-haiku-4.5",
@@ -9487,7 +9655,7 @@ _MODEL_CATALOG["mimo"] = {"default": "gpt-6.1-sol", "models": list(_MODEL_CATALO
 # chat-completions-only channel is what would fail here. MEASURED (2026-10-19, the Vercel
 # connection through the runner's own relay, five scenarios): claude-haiku-5.5 and gemini-3-flash,
 # each asked for and each served as itself over /v1/responses, across a mid-session switch its
-# session had pinned. The two Responses-API-only ids codex lists (gpt-5.3-codex, gpt-6-astra) are
+# session had pinned. The Responses-API-only ids codex lists (gpt-5.3-codex, gpt-6.2-astra, gpt-6-astra) are
 # NOT added here: this base could serve them and no turn has, and a list is not a place to guess.
 for _b in ("jcode", "opensquilla", "nanobot", "zeroclaw",
            "vibe", "docker-agent", "fast-agent", "dcode"):
@@ -9500,7 +9668,7 @@ for _b in ("jcode", "opensquilla", "nanobot", "zeroclaw",
 _MODEL_CATALOG["roder"] = {"default": "gpt-6.1-sol", "models": ["gpt-6.1-sol"]}
 # Bases still qualifying their wider catalog. Each offers only the models measured on it so far, and
 # its default was chosen for that start rather than measured across every provider column, so the
-# catalog-wide rules for a measured base (gpt-6.1-sol leads the gpt-6 family wherever it is offered,
+# catalog-wide rules for a measured base (gpt-6.1-sol leads the measured gpt-6 family wherever it is offered,
 # and is the default where it ran all five matrix scenarios) do not apply to it yet. This is the one
 # place that exception is written; a base leaves the set when its live column is in.
 _STILL_QUALIFYING: frozenset[str] = frozenset({"roder"})
@@ -9601,7 +9769,9 @@ _NOT_OFFERED: dict[str, frozenset[str]] = {
     "jcode": frozenset({"grok-build-0.1", "hunyuan-4-preview", "kimi-k3", "gemini-3-flash-preview",
                         "nemotron-3-super", "llama-3.3-70b", "muse-glimmer-30b", "muse-spark-1.1"}),
     "opensquilla": frozenset({"claude-opus-4.7", "grok-4.20", "llama-3.3-70b", "hunyuan-4-preview",
-                              "nemotron-3-super", "gpt-6.1-sol"}),
+                              "nemotron-3-super", "gpt-6.1-sol",
+                              # as gpt-6.1-sol; the 6.2 line's own measurement follows
+                              "gpt-6.2-sol"}),
     "nanobot": frozenset({"grok-build-0.1", "kimi-k3", "llama-3.3-70b", "grok-4.5", "nemotron-3-super",
                           "gpt-5.6-luna"}),
     "qoder": frozenset({"qfmodel", "efficient", "kmodel", "qmodel_latest"}),
@@ -9728,7 +9898,8 @@ for _b, _e in _MODEL_CATALOG.items():
 # 2026-09-05/07), and the harnesses that speak chat/completions and nothing else. A limitation, not
 # an omission: the support matrix lists these pairs as not run for that reason, and the chat-only
 # test forbids listing such an id for such a harness.
-RESPONSES_ONLY_MODELS = frozenset({"gpt-5.3-codex", "gpt-6-astra"})
+# gpt-6.2-astra: as gpt-6-astra; the 6.2 line's own measurement follows.
+RESPONSES_ONLY_MODELS = frozenset({"gpt-5.3-codex", "gpt-6.2-astra", "gpt-6-astra"})
 # kimi speaks chat/completions only: the runner defines its model with provider type `openai`
 # through the relay (Kimi Code CLI has an openai_responses type too, but it is not the one the runner
 # sets), so a Responses-API-only id would be a picker row that fails on send.
@@ -9806,7 +9977,9 @@ _PROVIDER_CLAUDE_IDS = {v.lower() for v in [*_BEDROCK_CLAUDE.values(), *_ANTHROP
 # sorts first. When nothing on the instance serves one, hermes keeps its default (the main
 # model), which is today's behaviour and the honest answer: we cannot route to a model that no
 # integration here can reach.
-_VISION_CAPABLE = ("claude-haiku-5.5", "claude-haiku-4.5", "gpt-5.4-mini", "claude-sonnet-5.5", "claude-sonnet-5", "gpt-5.6-luna", "gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol",
+# gpt-6.2-sol: as gpt-6.1-sol; the 6.2 line's own measurement follows. (gpt-6.2-astra is not here,
+# as gpt-6-astra is not.)
+_VISION_CAPABLE = ("claude-haiku-5.5", "claude-haiku-4.5", "gpt-5.4-mini", "claude-sonnet-5.5", "claude-sonnet-5", "gpt-5.6-luna", "gpt-6-luna", "gpt-6-sol", "gpt-6.2-sol", "gpt-6.1-sol",
                    "gpt-5.4", "claude-sonnet-4.6", "claude-opus-5.5", "claude-opus-5", "gpt-5.5")
 
 
@@ -9850,8 +10023,10 @@ async def _vision_auth(sid: str, backend: str) -> dict | None:
 # neither offers a row that fails on send. Keyed by the provider in both vocabularies (the
 # integrations' and the runner-native names a chain connection may carry).
 _CHAT_PASSTHROUGH = ("tokenrouter", "openai", "openai-api", "azure-foundry", "azure", "harnessrouter")
+# gpt-6.2-sol rides every pair below as gpt-6.1-sol; the 6.2 line's own measurement follows.
+_SOL_PASSTHROUGH_REFUSED = frozenset({"gpt-6.1-sol", "gpt-6.2-sol"})
 _CHANNEL_REFUSES: dict[tuple[str, str], frozenset[str]] = {
-    (p, b): frozenset({"gpt-6.1-sol"}) for p in _CHAT_PASSTHROUGH for b in ("vibe", "docker-agent", "fast-agent")}
+    (p, b): _SOL_PASSTHROUGH_REFUSED for p in _CHAT_PASSTHROUGH for b in ("vibe", "docker-agent", "fast-agent")}
 # The older chat-completions bases, the same refusal, measured the same way (2026-10-25, one tool turn
 # each, 0.37.0-rc.13): kimi, qwen and cline fail on My TokenRouter, OpenAI and Azure OpenAI; openhands
 # and cheetahclaws on My TokenRouter (openhands reaches OpenAI and Azure through litellm's Responses
@@ -9859,13 +10034,13 @@ _CHANNEL_REFUSES: dict[tuple[str, str], frozenset[str]] = {
 # beside the catalog recorded on 2026-10-02 and left listed.
 for _p in ("tokenrouter", "openai", "openai-api", "azure-foundry", "azure"):
     for _b in ("kimi", "qwen", "cline"):
-        _CHANNEL_REFUSES[(_p, _b)] = _CHANNEL_REFUSES.get((_p, _b), frozenset()) | {"gpt-6.1-sol"}
+        _CHANNEL_REFUSES[(_p, _b)] = _CHANNEL_REFUSES.get((_p, _b), frozenset()) | _SOL_PASSTHROUGH_REFUSED
 for _b in ("openhands", "cheetahclaws"):
-    _CHANNEL_REFUSES[("tokenrouter", _b)] = _CHANNEL_REFUSES.get(("tokenrouter", _b), frozenset()) | {"gpt-6.1-sol"}
+    _CHANNEL_REFUSES[("tokenrouter", _b)] = _CHANNEL_REFUSES.get(("tokenrouter", _b), frozenset()) | _SOL_PASSTHROUGH_REFUSED
 # And on the HarnessRouter API, measured once it had credit (0.37.0-rc.15, one tool turn each): kimi, qwen,
 # cline and cheetahclaws fail the same way; openhands completed (DONE, a Shell call).
 for _b in ("kimi", "qwen", "cline", "cheetahclaws"):
-    _CHANNEL_REFUSES[("harnessrouter", _b)] = _CHANNEL_REFUSES.get(("harnessrouter", _b), frozenset()) | {"gpt-6.1-sol"}
+    _CHANNEL_REFUSES[("harnessrouter", _b)] = _CHANNEL_REFUSES.get(("harnessrouter", _b), frozenset()) | _SOL_PASSTHROUGH_REFUSED
 # TokenRouter's route for claude-fable-5-1 declines docker-agent's first turn before a word is written
 # (finish_reason content_filter, 3 of 3, 2026-10-25), while on the same route vibe passes with it and
 # docker-agent passes with claude-fable-5, claude-opus-5.5 and claude-sonnet-5.5, and docker-agent
@@ -12178,6 +12353,16 @@ async def create_response(body: CreateResponseBody, request: Request):
         if not body.previous_response_id:
             raise uhp_error(400, "invalid_input", "A branch starts from the response named in "
                                                   "previous_response_id.", "branch")
+    # A resume (Tasks §3.3) is judged by its shape alone, here, before anything is read: a malformed
+    # one, or one with a branch, is a 400 whatever the response it names. Whether that response is
+    # interrupted is decided below, once the session is known.
+    resume_item = _split_resume(body.input)
+    if resume_item is not None and not body.previous_response_id:
+        raise uhp_error(400, "invalid_input", "A resume carries on the response named in "
+                                              "previous_response_id.", "previous_response_id")
+    if resume_item is not None and body.branch is True:
+        raise uhp_error(400, "invalid_input", "A branch does not resume the original response. Send "
+                                              "the resume without branch.", "branch")
     meta = body.metadata or {}
     probe = {"systemone": meta["systemone"]} if isinstance(meta.get("systemone"), dict) else None
     # harness id: request metadata, else the X-Harness-Id header (set by a front proxy that maps
@@ -12392,7 +12577,7 @@ async def create_response(body: CreateResponseBody, request: Request):
     history: list[dict] = []
     # An answer to the previous response's question (Tasks §3.2) is taken out before the rest of
     # the input is read as a message; it is checked once the session it answers in is resolved.
-    answer, live_input = _split_input_response(body.input)
+    answer, live_input = _split_input_response([] if resume_item is not None else body.input)
     if answer is not None and not body.previous_response_id:
         raise uhp_error(400, "invalid_input", "An input_response answers the response named in "
                                               "previous_response_id.", "previous_response_id")
@@ -12422,7 +12607,7 @@ async def create_response(body: CreateResponseBody, request: Request):
                 for f in files_in if f.get("content_b64") and f.get("filename")]
     if body.instructions:
         prompt = f"{body.instructions}\n\n---\n\n{prompt}"
-    if not prompt and not files_in and answer is None:
+    if not prompt and not files_in and answer is None and resume_item is None:
         raise HTTPException(400, "empty input")
     if files_in:
         names = ", ".join(f["filename"] for f in files_in)
@@ -12448,17 +12633,40 @@ async def create_response(body: CreateResponseBody, request: Request):
     extra_secret: list[str] = []
     voided: list[str] = []
     claimed: tuple[str, dict] | None = None
+    resume_claim: str | None = None         # the response whose resume this turn claimed (§3.3)
     # A later task passes the question over however it names the session (§3.2), so what a task
     # chains on is the session's newest response when it names no response of its own.
     _newest = ""
-    if answer is not None or (not body.previous_response_id and str(meta.get("session_id") or "").strip()):
+    if (answer is not None or resume_item is not None
+            or (not body.previous_response_id and str(meta.get("session_id") or "").strip())):
         with contextlib.suppress(Exception):
             _newest = str((await _session_turns_data(sid)).get("last_response_id") or "")
     _chained = None if branching else body.previous_response_id or _newest
     if _chained:
         _prev = await _resp_get(_chained)
         _pend = (_prev or {}).get("_pending_input") if isinstance(_prev, dict) else None
-        if answer is not None:
+        if resume_item is not None:
+            # Tasks §3.3: single-use and explicit. A response the server did not cut short is not
+            # resumable, and one a later task already resumed or passed over is not either (the
+            # session's newest response is no longer it). Read first as the sweep would leave it, so
+            # a turn cut by a restart that no read has settled yet still reads interrupted.
+            if (isinstance(_prev, dict) and str(_prev.get("status") or "") in _TURN_LIVE):
+                with contextlib.suppress(Exception):
+                    _prev = await _reconcile_response(_chained, _prev) or _prev
+            if not _is_interrupted(_prev):
+                raise uhp_error(409, "resume_not_pending", "That response was not interrupted, so there "
+                                "is nothing to resume.", "previous_response_id",
+                                {"previous_response_id": body.previous_response_id, "state": "not_interrupted"})
+            if _newest and _newest != body.previous_response_id:
+                raise uhp_error(409, "resume_not_pending", "A later task already resumed or passed that "
+                                "response over.", "previous_response_id",
+                                {"previous_response_id": body.previous_response_id, "state": "passed_over"})
+            note = (resume_item.get("note") or "").strip() or None
+            line = _resume_prompt(_prev, note)
+            prompt = line
+            user_text = "Resume the interrupted turn." + (f" {note}" if note else "")
+            input_items = [{"type": "resume", **({"note": note} if note else {})}]
+        elif answer is not None:
             if _newest and _newest != body.previous_response_id:
                 # a later task already ran: the question it passed over is no longer pending
                 raise uhp_error(409, "input_not_pending", "A later task passed that input request over.",
@@ -12502,6 +12710,21 @@ async def create_response(body: CreateResponseBody, request: Request):
             if str(existing.get("req_hash") or "") not in ("", idem_rhash or ""):
                 raise HTTPException(409, "Idempotency-Key reused with a different request payload")
             return await _idem_replay(str(existing.get("resp_id") or ""), bool(body.stream))
+    if resume_item is not None:
+        # The resume is claimed here, once: after the idempotency reservation, so a retry that carries
+        # the same key replays the first result instead of meeting its own claim, and before anything
+        # starts, so two resumes that arrive together cannot both run (Tasks §3.3, single-use).
+        try:
+            if not await _resume_claim(org, str(body.previous_response_id)):
+                raise uhp_error(409, "resume_not_pending", "That response was already resumed.",
+                                "previous_response_id",
+                                {"previous_response_id": body.previous_response_id, "state": "resumed"})
+        except BaseException:
+            if idem_key and idem_sha_v is not None:
+                with contextlib.suppress(Exception):
+                    await control_store.idem_release(org, idem_sha_v, resp_id)
+            raise
+        resume_claim = str(body.previous_response_id)
     if branching:
         try:
             # The same capacity gates as a turn, without publishing a heartbeat-only session.
@@ -12619,6 +12842,8 @@ async def create_response(body: CreateResponseBody, request: Request):
             # is not refused as already answered.
             with contextlib.suppress(Exception):
                 await _input_request_settle(org, claimed[0], claimed[1], "pending")
+        if resume_claim is not None:
+            await _resume_release(org, resume_claim)      # nothing ran: the retry may resume it
         raise
     # Past this point we are committed to executing; the turn will persist a terminal record even
     # on failure, so the reservation must stand (releasing would permit a double run).
